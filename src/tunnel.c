@@ -90,7 +90,9 @@ static void close_and_free_server(EV_P_ server_t *server);
 int vpn = 0;
 char *prefix;
 #endif
+
 int verbose = 0;
+int keep_resolving = 1;
 
 static int mode = TCP_ONLY;
 static int auth = 0;
@@ -181,7 +183,7 @@ static void server_recv_cb(EV_P_ ev_io *w, int revents)
         close_and_free_remote(EV_A_ remote);
         close_and_free_server(EV_A_ server);
         return;
-    } else if (r < 0) {
+    } else if (r == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // no data
             // continue to wait for recv
@@ -247,7 +249,7 @@ static void server_send_cb(EV_P_ ev_io *w, int revents)
         // has data to send
         ssize_t s = send(server->fd, server->buf->array + server->buf->idx,
                          server->buf->len, 0);
-        if (s < 0) {
+        if (s == -1) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 ERROR("send");
                 close_and_free_remote(EV_A_ remote);
@@ -305,7 +307,7 @@ static void remote_recv_cb(EV_P_ ev_io *w, int revents)
         close_and_free_remote(EV_A_ remote);
         close_and_free_server(EV_A_ server);
         return;
-    } else if (r < 0) {
+    } else if (r == -1) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // no data
             // continue to wait for recv
@@ -337,20 +339,22 @@ static void remote_recv_cb(EV_P_ ev_io *w, int revents)
             server->buf->idx = 0;
             ev_io_stop(EV_A_ & remote_recv_ctx->io);
             ev_io_start(EV_A_ & server->send_ctx->io);
-            return;
         } else {
             ERROR("send");
             close_and_free_remote(EV_A_ remote);
             close_and_free_server(EV_A_ server);
-            return;
         }
     } else if (s < server->buf->len) {
         server->buf->len -= s;
         server->buf->idx  = s;
         ev_io_stop(EV_A_ & remote_recv_ctx->io);
         ev_io_start(EV_A_ & server->send_ctx->io);
-        return;
     }
+
+    // Disable TCP_NODELAY after the first response are sent
+    int opt = 0;
+    setsockopt(server->fd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    setsockopt(remote->fd, SOL_TCP, TCP_NODELAY, &opt, sizeof(opt));
 }
 
 static void remote_send_cb(EV_P_ ev_io *w, int revents)
@@ -461,7 +465,7 @@ static void remote_send_cb(EV_P_ ev_io *w, int revents)
             // has data to send
             ssize_t s = send(remote->fd, remote->buf->array + remote->buf->idx,
                              remote->buf->len, 0);
-            if (s < 0) {
+            if (s == -1) {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     ERROR("send");
                     // close and free
@@ -623,7 +627,7 @@ static void accept_cb(EV_P_ ev_io *w, int revents)
     struct sockaddr *remote_addr = listener->remote_addr[index];
 
     int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
-    if (remotefd < 0) {
+    if (remotefd == -1) {
         ERROR("socket");
         return;
     }
@@ -643,6 +647,13 @@ static void accept_cb(EV_P_ ev_io *w, int revents)
     setsockopt(remotefd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
 
+    if (listener->mptcp == 1) {
+        int err = setsockopt(remotefd, SOL_TCP, MPTCP_ENABLED, &opt, sizeof(opt));
+        if (err == -1) {
+            ERROR("failed to enable multipath TCP");
+        }
+    }
+
     // Setup
     setnonblocking(remotefd);
 #ifdef SET_INTERFACE
@@ -660,7 +671,7 @@ static void accept_cb(EV_P_ ev_io *w, int revents)
 
     int r = connect(remotefd, remote_addr, get_sockaddr_len(remote_addr));
 
-    if (r < 0 && errno != CONNECT_IN_PROGRESS) {
+    if (r == -1 && errno != CONNECT_IN_PROGRESS) {
         ERROR("connect");
         close_and_free_remote(EV_A_ remote);
         close_and_free_server(EV_A_ server);
@@ -677,10 +688,19 @@ static void accept_cb(EV_P_ ev_io *w, int revents)
     }
 }
 
+void signal_cb(int dummy) {
+    keep_resolving = 0;
+    exit(-1);
+}
+
 int main(int argc, char **argv)
 {
+    srand(time(NULL));
+
     int i, c;
     int pid_flags    = 0;
+    int mptcp        = 0;
+    int mtu          = 0;
     char *user       = NULL;
     char *local_port = NULL;
     char *local_addr = NULL;
@@ -700,8 +720,10 @@ int main(int argc, char **argv)
 
     int option_index                    = 0;
     static struct option long_options[] = {
-        { "help", no_argument, 0, 0 },
-        {      0,           0, 0, 0 }
+        { "mtu",  required_argument, 0, 0 },
+        { "mptcp",no_argument,       0, 0 },
+        { "help", no_argument,       0, 0 },
+        {      0,           0,       0, 0 }
     };
 
     opterr = 0;
@@ -718,6 +740,12 @@ int main(int argc, char **argv)
         switch (c) {
         case 0:
             if (option_index == 0) {
+                mtu = atoi(optarg);
+                LOGI("set MTU to %d", mtu);
+            } else if (option_index == 1) {
+                mptcp = 1;
+                LOGI("enable multipath TCP");
+            } else if (option_index == 2) {
                 usage();
                 exit(EXIT_SUCCESS);
             }
@@ -836,6 +864,18 @@ int main(int argc, char **argv)
         if (auth == 0) {
             auth = conf->auth;
         }
+        if (tunnel_addr_str == NULL) {
+            tunnel_addr_str = conf->tunnel_address;
+        }
+        if (mode == TCP_ONLY) {
+            mode = conf->mode;
+        }
+        if (mtu == 0) {
+            mtu = conf->mtu;
+        }
+        if (mptcp == 0) {
+            mptcp = conf->mptcp;
+        }
 #ifdef HAVE_SETRLIMIT
         if (nofile == 0) {
             nofile = conf->nofile;
@@ -889,6 +929,8 @@ int main(int argc, char **argv)
     // ignore SIGPIPE
     signal(SIGPIPE, SIG_IGN);
     signal(SIGABRT, SIG_IGN);
+    signal(SIGINT,  signal_cb);
+    signal(SIGTERM, signal_cb);
 #endif
 
     // Setup keys
@@ -914,6 +956,7 @@ int main(int argc, char **argv)
     listen_ctx.timeout = atoi(timeout);
     listen_ctx.iface   = iface;
     listen_ctx.method  = m;
+    listen_ctx.mptcp   = mptcp;
 
     struct ev_loop *loop = EV_DEFAULT;
 
@@ -921,7 +964,7 @@ int main(int argc, char **argv)
         // Setup socket
         int listenfd;
         listenfd = create_and_bind(local_addr, local_port);
-        if (listenfd < 0) {
+        if (listenfd == -1) {
             FATAL("bind() error:");
         }
         if (listen(listenfd, SOMAXCONN) == -1) {
@@ -940,7 +983,7 @@ int main(int argc, char **argv)
         LOGI("UDP relay enabled");
         init_udprelay(local_addr, local_port, listen_ctx.remote_addr[0],
                       get_sockaddr_len(listen_ctx.remote_addr[0]),
-                      tunnel_addr, m, auth, listen_ctx.timeout, iface);
+                      tunnel_addr, mtu, m, auth, listen_ctx.timeout, iface);
     }
 
     if (mode == UDP_ONLY) {
